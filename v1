@@ -1,0 +1,152 @@
+#!/usr/bin/python -u
+# The -u makes output unbuffered, so it will show up immediately
+import sys, socket, select, json, threading, random, time
+
+# fields: address (hex) port (number)
+forwardingTable = {}
+sockets = []
+disabledsockets = []
+id = ''
+root = ''
+cost = 0
+rootPort = -1
+designatedPort = -1
+dataCache = []
+
+# pads the name with null bytes at the end
+def pad(name):
+    result = '\0' + name
+    while len(result) < 108:
+        result += '\0'
+    return result
+
+
+def recMessage(message, port):
+    global dataCache
+    jmessage = json.loads(message)
+    if jmessage['type'] == 'bpdu':
+        recBPDU(jmessage["message"], port, jmessage['source'])
+    elif jmessage['type'] == 'data' and port not in disabledsockets:
+        if jmessage not in dataCache:
+	    dataCache.append(jmessage)
+	    recData(jmessage, port)
+
+
+def recBPDU(message, port, source):
+    # Construct and update the spanning tree information
+    global root, cost, rootPort, designatedPort
+    if message['root'] < root:
+        root = message['root']
+        cost = message['cost'] + 1
+        rootPort = port
+	designatedPort = port
+	print("New root: " + str(id) + "/"  + str(message['root']))
+	print("New root port " + str(id) + "/" +  str(rootPort))
+    elif (message['root'] == root) and (message['cost']+1 < cost):
+        cost = message['cost'] + 1
+        rootPort = port
+	designatedPort = port
+	print("New root port " + str(id) + "/" + str(rootPort))
+    elif (message['root'] == root) and (message['cost']+1 == cost) and (message['id'] < 'id') and port < designatedPort:
+        rootPort = port
+	designatedPort = port
+	print("New root port: " + str(id) + "/" + str(rootPort))
+    spanningTree(port, message["cost"]+1, source)
+    
+def spanningTree(port, oCost, oID):
+    print("id: " + str(id) + " Port: " + str(port) + " oCost: " + str(oCost) + " oID: " + str(oID))
+    if id != root:
+        if port != rootPort:
+            if oCost > cost:
+                disabledsockets.append(port)
+            elif oCost == cost and port != designatedPort:
+                disabledsockets.append(port)
+		print("Disabled port: " + str(id) + "/" + str(port))
+
+def recData(message, port):
+    # Construct and update the forwarding table information
+    global forwardingTable
+    id = message['message']
+    print("Received message " + str(id['id']) + " on port " + str(port) + " from " + str(message['source']) + ' to ' + str(message['dest']))
+    if forwardingTable.get(message['source'], -1) == -1:
+        forwardingTable[message['source']] = port
+    if forwardingTable.get(message['dest'], -1) == -1:
+        print("Broadcasting message " + str(id['id']) + " to all ports")
+        sendPacket(message, "ffff")
+    else:
+        print("Forwarding message " + str(id['id']) + " to port " + str((forwardingTable.get(message['dest']))))
+        sendPacket(message, message['dest'])
+
+def genID():
+    return "%03x" % random.randint(0, 0xFFFF)
+
+
+def broadcastBPDU():
+    # broadcast BPDU message to all
+    bpdu = {}
+    bpdu['source'] = id
+    bpdu['dest'] = 'ffff'
+    bpdu['type'] = 'bpdu'
+    bpduMessage = {}
+    bpduMessage['id'] = genID()
+    bpduMessage['root'] = root
+    bpduMessage['cost'] = cost
+    bpdu['message'] = bpduMessage
+    sendPacket(bpdu, "ffff")
+
+
+def sendPacket(jsonM, destination):
+    if destination == "ffff":
+        for x in sockets:
+            if sockets.index(x) not in disabledsockets:
+		x.send(json.dumps(jsonM))
+    else:
+        for x in chooseSocket(destination):
+            x.send(json.dumps(jsonM))
+
+
+def chooseSocket(destination):
+    temp = forwardingTable.get(destination, -1)
+    if temp == -1:
+        return sockets
+    else:
+        return [sockets[temp]]
+
+
+if __name__ == "__main__":
+    global sockets, id, root, cost
+    id = sys.argv[1]
+    LAN = sys.argv[2:]
+    sockets = []
+    root = id
+    cost = 0
+    
+    start_time = time.time()
+    
+    #removes duplicates from LAN
+    LAN = list(set(LAN))
+
+    # creates sockets and connects to them
+    for x in range(len(LAN)):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        s.connect(pad(LAN[x]))
+        sockets.append(s)
+
+    print("Bridge " + id + " starting up\n")
+    
+    
+    broadcastBPDU()
+    last_called = time.time()	
+
+    # Main loop
+    while True:
+        # Calls select with all the sockets; change the timeout value (1)
+        ready, ignore, ignore2 = select.select(sockets, [], [], .5)
+	
+	if time.time() - 500 > last_called:
+	    broadcastBPDU()
+            last_called = time.time()
+        # Reads from each fo the ready sockets
+        for x in ready:
+            data = x.recv(1500)
+            recMessage(data, sockets.index(x))
